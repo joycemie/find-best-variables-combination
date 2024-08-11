@@ -1,0 +1,595 @@
+---
+title: "final_project"
+author: "Jie Chen"
+date: "2024-07-25"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(readr)
+library(tidyr)
+library(caret)
+library(FNN)
+```
+
+
+#加载代码：
+```{r}
+data <- read.csv("C:/Users/陈婕/Desktop/algforestfires.csv")
+
+# Clean column names by removing leading/trailing spaces
+names(data) <- trimws(names(data))
+
+# Convert 'DC' column to numeric, forcing errors to NA
+data$DC <- as.numeric(data$DC)
+
+# Remove rows with NA values in 'DC' column
+data_cleaned <- data %>% drop_na(DC)
+
+# Exclude 'Classes' and 'Region' columns for standardization
+covariates <- data_cleaned %>% select(-Classes, -Region, -day, -month, -year, -Rain)
+
+# Standardize the covariates
+preprocess_params <- preProcess(covariates, method = c("center", "scale"))
+standardized_covariates <- predict(preprocess_params, covariates)
+
+```
+
+
+#预处理数据：
+```{r}
+df_2_bs <- data_cleaned
+
+### 2. WEIGHTED PROBABILITIES (BEST)
+
+###### bootstrapping
+
+# Number of bootstrap samples
+n_bootstrap <- 100
+
+# Calculate the response variable with bootstrapping
+calculate_response_bootstrap <- function(standardized_covariates, classes, n_neighbors, sigma, n_bootstrap) {
+  n <- nrow(standardized_covariates)
+  response_matrix <- matrix(0, nrow = n, ncol = n_bootstrap)
+  
+  for (b in 1:n_bootstrap) {
+    # Create a bootstrap sample
+    bootstrap_indices <- sample(1:n, replace = TRUE)
+    bootstrap_covariates <- standardized_covariates[bootstrap_indices, ]
+    bootstrap_classes <- classes[bootstrap_indices]
+    
+    # Calculate the response for the bootstrap sample
+    nn <- get.knnx(bootstrap_covariates, standardized_covariates, k = n_neighbors)
+    distances <- nn$nn.dist
+    indices <- nn$nn.index
+    
+    response_probabilities <- sapply(1:n, function(i) {
+      weights <- exp(-distances[i, ]^2 / (2 * sigma^2))
+      weights <- weights / sum(weights)
+      fire_count <- sum(weights * (bootstrap_classes[indices[i, ]] == 0))
+      return(fire_count)
+    })
+    
+    response_matrix[, b] <- response_probabilities
+  }
+  
+  # Average the response variables from all bootstrap samples
+  final_response <- rowMeans(response_matrix)
+  return(final_response)
+}
+
+
+# Different Sigma Values
+sigma_values <- c(0.1, 0.5, 0.75, 1)
+response_probabilities_list <- lapply(sigma_values, function(sigma) {
+  calculate_response_bootstrap(standardized_covariates, df_2_bs$Classes, n_neighbors = 10, sigma, n_bootstrap)
+})
+
+# Add the new response variable to the cleaned dataframe for each sigma value
+for (i in seq_along(sigma_values)) {
+  df_2_bs[[paste0("Response_sigma_", sigma_values[i])]] <- response_probabilities_list[[i]]
+}
+
+#df_2_bs$Response_sigma_1 <- 1 - df_2_bs$Response_sigma_1
+df_2_bs <- subset(df_2_bs, select = -c(day, month, year, Response_sigma_0.1, Response_sigma_0.5, Response_sigma_0.75, Classes, Region))
+```
+
+
+```{r}
+PLOTTEXTSIZE <- 2
+# linear regression model and diagnostics
+linmod <- lm(Response_sigma_1 ~ Temperature + RH + Ws + FFMC + DMC + DC + ISI + BUI + FWI, data = df_2_bs)
+summary(linmod)
+par(mfrow=c(1, 2))
+plot(residuals(linmod) ~ fitted(linmod), pch = 20,
+  main = "Residual plot, linear model", 
+  ylab = "Residuals", xlab = "Fitted values",
+  cex.main = PLOTTEXTSIZE, cex.lab = PLOTTEXTSIZE, cex.axis = PLOTTEXTSIZE
+)
+abline(h = 0, col = "red", lty = "dashed")
+qqnorm(residuals(linmod))
+
+qqline(residuals(linmod))
+
+```
+
+
+#调整数据
+```{r, eval=FALSE}
+df_filtered <- df_2_bs %>% filter(Response_sigma_1 != 0 & Response_sigma_1 != 1)
+#df_filtered <- subset(df_filtered, select = -c(day, month, year, Response_sigma_0.1, Response_sigma_0.5, Response_sigma_0.75, Classes))
+```
+
+#eda:
+```{r}
+plot(y = df_2_bs$Response_sigma_1, x = df_2_bs$Rain,xlab = "Rain", ylab = "Response", 
+     main = "association between Response and Rain")
+```
+
+
+```{r}
+box = subset(df_filtered, select = -c(Rain, Response_sigma_1))
+boxplot(box,
+        main = "Box Plot of Covariates in algforestfires Dataset",
+        xlab = "Covariates",
+        ylab = "Values",
+
+        las = 2) # las = 2 makes the labels perpendicular to the axis
+
+# Optionally, add horizontal grid lines
+grid(nx = NULL, ny = NULL, col = "lightgray", lty = "dotted")
+```
+
+
+#rain这个很不稳定，不能用
+```{r}
+# 定义一个函数来识别异常值
+is_outlier <- function(x) {
+  Q1 <- quantile(x, 0.25)
+  Q3 <- quantile(x, 0.75)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  return(x < lower_bound | x > upper_bound)
+}
+
+
+covariates <- as.data.frame(df_filtered)
+
+# 标记包含异常值的行
+#outlier_rows <- apply(covariates, 1, function(row) any(is_outlier(row)))
+
+# 删除包含异常值的行
+#covariates_no_outliers <- covariates[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates$DMC)
+
+covariates_no_outliers <- covariates[!outlier_rows, ]
+
+# outlier_rows <- is_outlier(covariates_no_outliers$Temperature)
+# 
+# covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+# 
+# outlier_rows <- is_outlier(covariates_no_outliers$RH)
+# 
+# covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$Ws)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$FFMC)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$DC)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$ISI)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$BUI)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$FWI)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$DMC)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$DC)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$ISI)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$DC)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$FWI)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$DMC)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$FFMC)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$ISI)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+outlier_rows <- is_outlier(covariates_no_outliers$Ws)
+
+covariates_no_outliers <- covariates_no_outliers[!outlier_rows, ]
+
+covariates_no_outliers = subset(covariates_no_outliers, select = -c(Rain))
+```
+
+```{r}
+covariates1 <- covariates_no_outliers %>% select(-Response_sigma_1)
+# Create a box plot for all covariates
+boxplot(covariates1,
+        main = "Box Plot of Covariates in algforestfires Dataset",
+        xlab = "Covariates",
+        ylab = "Values",
+
+        las = 2) # las = 2 makes the labels perpendicular to the axis
+
+# Optionally, add horizontal grid lines
+grid(nx = NULL, ny = NULL, col = "lightgray", lty = "dotted")
+covariates_no_outliers$Response_sigma_1 = 1 - covariates_no_outliers$Response_sigma_1
+df_2_bs <- covariates_no_outliers
+```
+
+
+```{r}
+par(mfrow=c(2, 3))
+#plot(y = df_2_bs$Response_sigma_1, x = df_2_bs$Temperature, ylab = "Response", xlab = "Temp")
+#plot(y = df_2_bs$Response_sigma_1, x = df_2_bs$RH, ylab = "Response", xlab = "RH")
+#plot(y = df_2_bs$Response_sigma_1, x = df_2_bs$Ws, ylab = "Response", xlab = "Ws")
+plot(y = df_2_bs$Response_sigma_1, x = df_2_bs$FFMC, ylab = "Response", xlab = "FFMC")
+#plot(y = df_2_bs$Response_sigma_1, x = df_2_bs$DMC, ylab = "Response", xlab = "DMC")
+#plot(y = df_2_bs$Response_sigma_1, x = df_2_bs$DC, ylab = "Response", xlab = "DC")
+plot(y = df_2_bs$Response_sigma_1, x = df_2_bs$ISI, ylab = "Response", xlab = "ISI")
+#plot(y = df_2_bs$Response_sigma_1, x = df_2_bs$BUI, ylab = "Response", xlab = "BUI")
+plot(y = df_2_bs$Response_sigma_1, x = df_2_bs$FWI, ylab = "Response", xlab = "FWI")
+plot(y = df_2_bs$DMC, x = df_2_bs$BUI, ylab = "DMC", xlab = "BUI")
+plot(y = df_2_bs$ISI, x = df_2_bs$FWI, ylab = "ISI", xlab = "FWI")
+```
+
+
+
+#method:
+#选出variable
+```{r}
+PLOTTEXTSIZE <- 2
+
+library(glmnet)
+
+# First, a "real data" example
+
+prostate_scaled <- df_2_bs
+#prostate_scaled <- df_filtered
+
+for (i in 1:(ncol(df_2_bs) - 1)) prostate_scaled[ ,i] <- (prostate_scaled[ ,i] - mean(prostate_scaled[ ,i])) / sd(prostate_scaled[ ,i])
+
+# Could we obtain the same fit using fewer variables?
+# How about stepwise selection?
+# There are 9 candidate predictors so there are 2^9 = 512
+# models. We could just fit them all.
+
+predictors <- colnames(df_2_bs)[-c(1,10)]
+getsubset <- function(size) combn(predictors, size, simplify = FALSE)
+allsubsets <- Reduce(c, lapply(1:length(predictors), getsubset)) # List of all possible combinations
+# Fit them all and calculate GCV
+y <- prostate_scaled$Response_sigma_1
+n <- length(y)
+
+linmod_GCV <- function(mod) {
+  yhat <- predict(mod)
+  p <- ncol(model.matrix(mod))
+  # GCV score
+  mean( (y - yhat)^2 / (1 - p/n)^2 )
+}
+
+modelscores <- list()
+length(modelscores) <- length(allsubsets) + 1
+modelscores[[1]] <- list(
+  model = "Null",
+  score = linmod_GCV(lm(Response_sigma_1 ~ 1, data = prostate_scaled)) # Null model
+)
+
+
+
+for (j in 1:length(allsubsets)) {
+  vars <- allsubsets[[j]]
+  ff <- formula(paste("Response_sigma_1 ~ ", paste(vars, collapse = "+")))
+  mod <- lm(ff, data = prostate_scaled)
+  gcv <- linmod_GCV(mod)
+  modelscores[[j + 1]] <- list(
+    model = vars,
+    score = gcv
+  )
+}
+
+# Cool. Sort them.
+scores <- Reduce(c, Map("[[", modelscores, "score"))
+scoreorder <- order(scores)
+modelscores <- modelscores[scoreorder]
+
+library(knitr)
+modelscores[1:20]
+
+#[1] RH, Ws, FFMC, DC, ISI
+
+#RH, FFMC, FWI
+
+# 加载所需的包
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+odd_indices <- seq(1, length(modelscores), by = 1)
+odd_modelscores <- modelscores[odd_indices]
+
+# 创建一个数据框来存储提取的结果
+results_df <- data.frame(
+  Model = sapply(odd_modelscores, function(x) paste(x$model, collapse = ", ")),
+  Score = sapply(odd_modelscores, function(x) x$score)
+)
+
+# 显示数据框
+results_df
+
+# 使用kable和kableExtra创建表格
+kable(results_df, caption = "Odd Models and Their Scores") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+#RH, Ws, FFMC, ISI, BUI
+#RH, Ws, FFMC, FWI
+```
+
+
+#the basic one
+```{r}
+# linear regression model and diagnostics
+linmod <- lm(Response_sigma_1 ~ Temperature + RH + Ws + FFMC + DMC + DC + ISI + BUI + FWI, data = prostate_scaled)
+summary(linmod)
+par(mfrow=c(1, 2))
+plot(residuals(linmod) ~ fitted(linmod), pch = 20,
+  main = "Residual plot, linear model", 
+  ylab = "Residuals", xlab = "Fitted values",
+  cex.main = PLOTTEXTSIZE, cex.lab = PLOTTEXTSIZE, cex.axis = PLOTTEXTSIZE
+)
+abline(h = 0, col = "red", lty = "dashed")
+qqnorm(residuals(linmod))
+
+qqline(residuals(linmod))
+
+linmod_GCV(linmod)
+```
+
+# Which model do you choose?
+#the best one
+```{r}
+library(broom)
+multi_reg0 <- lm(Response_sigma_1 ~ RH+ Ws + FFMC+ BUI + ISI , data = df_2_bs)
+summary(multi_reg0)
+
+par(mfrow=c(1, 2))
+plot(fitted(multi_reg0), residuals(multi_reg0), main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = "dashed")
+qqnorm(residuals(multi_reg0))
+
+qqline(residuals(multi_reg0))
+```
+
+#the Simplest with nearly as high a score:
+```{r}
+multi_reg1 <- lm(Response_sigma_1 ~ RH + +Ws+ FFMC + FWI, data = df_2_bs)
+summary(multi_reg1)
+
+par(mfrow=c(1, 2))
+plot(fitted(multi_reg1), residuals(multi_reg1), main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = "dashed")
+qqnorm(residuals(multi_reg1))
+
+qqline(residuals(multi_reg1))
+```
+
+#rideg and Lasso
+#Ridge回归和Lasso回归通过引入正则化项，可以减少模型的复杂度，从而降低过拟合的风险。
+#在数据集中，预测变量之间可能存在多重共线性，即一些预测变量之间存在高度相关性。这会导致线性回归模型的系数估计不稳定。
+#Ridge回归通过引入L2正则化项，能够处理多重共线性的问题，使得系数估计更加稳定。
+#Lasso回归通过引入L1正则化项，可以同时进行变量选择和模型正则化，有效地处理多重共线性问题
+#如降低过拟合风险、处理多重共线性、进行变量选择和提高模型的泛化能力
+
+```{r}
+calculate_gcv <- function(model, X, y, lambda) {
+  # 获取预测值
+  y_hat <- predict(model, s = lambda, newx = X)
+  
+  # 计算残差
+  residuals <- y - y_hat
+  
+  # 模型自由度（非零系数的数量）
+  p <- sum(coef(model, s = lambda) != 0)
+  
+  # 样本数量
+  n <- length(y)
+  
+  # 计算 GCV 分数
+  gcv <- mean(residuals^2) / (1 - p/n)^2
+  return(gcv)
+}
+
+## Ridge, with glmnet ##
+
+X <- model.matrix(linmod)
+glmnetridgecv <- cv.glmnet(X, y, alpha = 0)
+plot(glmnetridgecv)
+
+minlambda <- glmnetridgecv$lambda.min
+glmnetridge_nocv <- glmnet(X, y, alpha = 0)
+plot(glmnetridge_nocv, xvar = "lambda")
+# Which variables do you think are those top curves?
+round(t(glmnetridge_nocv$beta), 4)
+
+glmnetridge_withcv <- glmnet(X, y, alpha = 0, lambda = minlambda)
+glmnetridge_withcv$beta # Coefficient estimates
+result = cbind(glmnetridge_withcv$beta, coef(linmod))
+
+library(Matrix)  # 确保加载了 Matrix 包
+
+# 将稀疏矩阵转换为数据框
+result_df <- as.data.frame(as.matrix(result))
+
+# 打印结果
+print(result_df)
+
+# 显示数据框
+results_ridge
+
+gcv_ridge <- calculate_gcv(glmnetridgecv, X, y, minlambda)
+gcv_ridge
+```
+
+
+```{r}
+## LASSO, with glmnet ##
+
+glmnetlassocv <- cv.glmnet(X, y, alpha = 1, nfolds = 10)
+plot(glmnetlassocv)
+#larger lambda, simpler model, bet on sparisity
+
+minlambda <- glmnetlassocv$lambda.min
+glmnetlasso_nocv <- glmnet(X, y, alpha = 1)
+plot(glmnetlasso_nocv, xvar = "lambda")
+# Which variables do you think that is?
+coef(glmnetridge_nocv, s = minlambda)
+round(t(glmnetlasso_nocv$beta), 4)
+
+# Try it with the min lambda
+glmnetlasso_withcv <- glmnet(X, y, alpha = 1, lambda = minlambda)
+glmnetlasso_withcv$beta # Coefficient estimates
+# Too many!
+# "1se"?
+lambda1se <- glmnetlassocv$lambda.1se
+glmnetlasso_1se <- glmnet(X, y, alpha = 1, lambda = lambda1se)
+glmnetlasso_1se$beta # Coefficient estimates
+#coef(multi_reg1)[2:3]
+#coef(linmod)[c(6, 9)]
+result = cbind(glmnetlasso_1se$beta, coef(linmod))
+result
+library(Matrix)  # 确保加载了 Matrix 包
+
+# 将稀疏矩阵转换为数据框
+result_df <- as.data.frame(as.matrix(result))
+
+# 打印结果
+print(result_df)
+
+gcv_lasso1 <- calculate_gcv(glmnetlasso_withcv, X, y, minlambda)
+gcv_lasso1
+
+gcv_lasso2 <- calculate_gcv(glmnetlasso_1se, X, y, lambda1se)
+gcv_lasso2
+```
+
+
+```{r}
+## elastic net ##
+
+#aa <- .88 # Choose some different alphas
+aa = 0.01
+best = 1
+best_aa = 1
+while(aa <=0.99) {
+glmnetcv <- cv.glmnet(X, y, alpha = aa)
+glmnetnocv <- glmnet(X, y, alpha = aa)
+# Which variables do you think that is?
+round(t(glmnetnocv$beta), 4)
+lambda1se <- glmnetcv$lambda.1se
+glmnet_1se <- glmnet(X, y, alpha = aa, lambda = lambda1se)
+glmnet_1se$beta # Coefficient estimates
+#coef(multi_reg1)[2:3]
+#coef(linmod)[c(6, 9)]
+
+gcv_elastic <- calculate_gcv(glmnetcv, X, y, lambda1se)
+gcv_elastic
+if (gcv_elastic < best) {
+  best = gcv_elastic
+  best_aa = aa
+}
+#[1] 0.02183021
+aa = aa + 0.01
+}
+best_aa
+best
+
+plot(glmnetcv)
+plot(glmnetnocv, xvar = "lambda")
+
+minlambda <- glmnetcv$lambda.min
+coef(glmnetcv, s = minlambda)
+result = cbind(glmnetcv$beta, coef(linmod))
+result
+lambda1se <- glmnetcv$lambda.1se
+coef(glmnetcv, s = lambda1se)
+
+```
+
+
+#不确定
+#additive model:
+#平滑参数选择：
+#平滑参数（如k值）选择得比较合适，使得模型在数据上拟合得较好，从而导致GCV分数较低。
+
+#模型复杂度低：
+#虽然GAM模型允许非线性关系，但在你的数据中，平滑项并没有显著的非线性，这可能使模型的复杂度较低，从而得到较低的GCV分数。
+
+#变量之间的关系：
+#数据中的某些协变量可能确实对响应变量有很小的影响，但整体模型仍然能够很好地解释数据变化。
+```{r}
+library(mgcv)
+library(gamair)
+
+min_gcv = 0
+best_k = 0
+for (knots in 8:20) {
+mod <- gam(Response_sigma_1 ~ s(Temperature, bs = "bs", k = knots) + s(RH, bs = "bs", k = knots) + s(Ws, bs = "bs", k = knots) + s(FFMC, bs = "bs", k = knots) + s(DMC, bs = "bs", k = knots) + s(DC, bs = "bs", k = knots)+ s(ISI, bs = "bs", k = knots) + s(BUI, bs = "bs", k = knots) + s(FWI, bs = "bs", k = knots), data = df_2_bs)
+
+if (knots == 8) {
+  min_gcv = mod$gcv.ubre
+   best_k = knots
+}
+ if(mod$gcv.ubre < min_gcv) {
+   min_gcv = mod$gcv.ubre
+   best_k = knots
+ }
+}
+
+best_k
+min_gcv
+
+summary(mod)
+plot(mod, pages = 1, rug = TRUE)
+
+```
+
+
+
+
